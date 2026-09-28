@@ -32,6 +32,7 @@
 #include "ratecontrol.h"
 #include "macroblock.h"
 #include "me.h"
+#include "nn_intra.h"
 #if HAVE_INTEL_DISPATCHER
 #include "extras/intel_dispatcher.h"
 #endif
@@ -1174,6 +1175,13 @@ static int validate_parameters( x264_t *h, int b_open )
         h->param.analyse.intra &= ~X264_ANALYSE_I8x8;
     }
     h->param.analyse.i_trellis = x264_clip3( h->param.analyse.i_trellis, 0, 2 );
+    h->param.analyse.i_nn_level = x264_clip3( h->param.analyse.i_nn_level, 0, X264_NN_NUM_LEVELS-1 );
+    if( h->param.analyse.i_nn_level && !X264_NN_WEIGHTS_TRAINED )
+    {
+        if( b_open )
+            x264_log( h, X264_LOG_WARNING, "nn: weights aren't trained yet, disabling (--nn ignored)\n" );
+        h->param.analyse.i_nn_level = 0;
+    }
     h->param.rc.i_aq_mode = x264_clip3( h->param.rc.i_aq_mode, 0, 3 );
     h->param.rc.f_aq_strength = x264_clip3f( h->param.rc.f_aq_strength, 0, 3 );
     if( h->param.rc.f_aq_strength == 0 )
@@ -1886,6 +1894,7 @@ static int encoder_try_reconfig( x264_t *h, x264_param_t *param, int *rc_reconfi
     if( h->param.analyse.i_subpel_refine )
         COPY( analyse.i_subpel_refine );
     COPY( analyse.i_trellis );
+    COPY( analyse.i_nn_level );
     COPY( analyse.b_chroma_me );
     COPY( analyse.b_dct_decimate );
     COPY( analyse.b_fast_pskip );
