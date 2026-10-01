@@ -34,6 +34,7 @@
 #include "nn_i4rank.h"
 #include "nn_p16.h"
 #include "nn_p8x8.h"
+#include "nn_b16.h"
 #include "rdo.c"
 
 typedef struct
@@ -714,6 +715,18 @@ static const int32_t x264_nn_p8x8_bias[X264_NN_NUM_LEVELS] = {0, 100, 500, 32767
 static int32_t x264_nn_p8x8_bias_lookup( int level )
 {
     return x264_nn_p8x8_bias[level];
+}
+
+/* Regret threshold for X264_NN_B16_POLICY_STOP, indexed by --nn level.
+ * Calibrated against real BD-rate/speed. Unlike the other nets, BD-rate
+ * cost stays low even fully engaged -- skipping BI rarely costs much
+ * quality -- so the real speedup is correspondingly modest. Level 1 stays
+ * off; 2-5 escalate steadily. */
+static const int32_t x264_nn_b16_bias[X264_NN_NUM_LEVELS] = {0, 0, 1500, 3000, 6000, 10000};
+
+static int32_t x264_nn_b16_bias_lookup( int level )
+{
+    return x264_nn_b16_bias[level];
 }
 
 /* FIXME: should we do any sort of merged chroma analysis with 4:4:4? */
@@ -2048,6 +2061,23 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
             l--;
     }
 
+    /* STOP guards the entire BI block below (otherwise unconditional):
+     * a->i_cost16x16bi stays at its COST_MAX sentinel, so the outer
+     * L0/L1/Direct/BI selection never picks BI. Left un-reindented to keep
+     * the diff against the block's original form minimal. */
+    int b_b16_block_stop = 0;
+    if( h->param.analyse.i_nn_level && X264_NN_B16_WEIGHTS_TRAINED )
+    {
+        int32_t satd_l0 = a->l0.me16x16.cost - a->l0.me16x16.cost_mv - a->l0.me16x16.i_ref_cost;
+        int32_t satd_l1 = a->l1.me16x16.cost - a->l1.me16x16.cost_mv - a->l1.me16x16.i_ref_cost;
+        b_b16_block_stop = x264_nn_b16_policy( h, a->i_qp, satd_l0, a->l0.me16x16.cost_mv, a->l0.me16x16.i_ref,
+                                               satd_l1, a->l1.me16x16.cost_mv, a->l1.me16x16.i_ref,
+                                               a->i_cost16x16direct,
+                                               x264_nn_b16_bias_lookup( h->param.analyse.i_nn_level ) )
+                          == X264_NN_B16_POLICY_STOP;
+    }
+    if( !b_b16_block_stop )
+    {
     /* get cost of BI mode */
     h->mc.memcpy_aligned( &a->l0.bi16x16, &a->l0.me16x16, sizeof(x264_me_t) );
     h->mc.memcpy_aligned( &a->l1.bi16x16, &a->l1.me16x16, sizeof(x264_me_t) );
@@ -2143,8 +2173,10 @@ static void mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
         }
     }
 
-    /* mb type cost */
+    /* mb type cost (BI) */
     a->i_cost16x16bi   += a->i_lambda * i_mb_b_cost_table[B_BI_BI];
+    } /* !b_b16_block_stop */
+    /* mb type cost (L0/L1): independent of the BI decision, always applied */
     a->l0.me16x16.cost += a->i_lambda * i_mb_b_cost_table[B_L0_L0];
     a->l1.me16x16.cost += a->i_lambda * i_mb_b_cost_table[B_L1_L1];
 }
