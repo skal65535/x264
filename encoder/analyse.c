@@ -30,6 +30,8 @@
 #include "me.h"
 #include "ratecontrol.h"
 #include "analyse.h"
+#include "nn_intra.h"
+#include "nn_i4rank.h"
 #include "rdo.c"
 
 typedef struct
@@ -664,6 +666,28 @@ static void mb_analyse_intra_chroma( x264_t *h, x264_mb_analysis_t *a )
     h->mb.i_chroma_pred_mode = a->i_predict8x8chroma;
 }
 
+/* Regret threshold (raw logit units) X264_NN_I16_POLICY_STOP must beat
+ * CONTINUE by, indexed by --nn level (0 = off). Calibrated against real
+ * BD-rate/speed on all-intra content; level 1 is nearly free, with
+ * diminishing returns higher up. */
+static const int32_t x264_nn_i16_bias[X264_NN_NUM_LEVELS] = {0, 60, 550, 1600, 2700, 4500};
+
+static int32_t x264_nn_i16_bias_lookup( int level )
+{
+    return x264_nn_i16_bias[level];
+}
+
+/* Number (of 9) of ranked Intra4 modes kept for real RD-cost evaluation,
+ * indexed by --nn level (0 = unused, all 9 kept). Not monotonic with
+ * BD-rate cost -- topk=2 beats both 1 and 9 -- so it's pinned at 2 for
+ * every level; x264_nn_i16_bias alone controls aggressiveness. */
+static const int x264_nn_i4rank_topk_table[X264_NN_NUM_LEVELS] = {9, 2, 2, 2, 2, 2};
+
+static int x264_nn_i4rank_topk_lookup( int level )
+{
+    return x264_nn_i4rank_topk_table[level];
+}
+
 /* FIXME: should we do any sort of merged chroma analysis with 4:4:4? */
 static void mb_analyse_intra( x264_t *h, x264_mb_analysis_t *a, int i_satd_inter )
 {
@@ -694,6 +718,13 @@ static void mb_analyse_intra( x264_t *h, x264_mb_analysis_t *a, int i_satd_inter
         /* Not heavily tuned */
         static const uint8_t i16x16_thresh_lut[11] = { 2, 2, 2, 3, 3, 4, 4, 4, 4, 4, 4 };
         int i16x16_thresh = a->b_fast_intra ? (i16x16_thresh_lut[h->mb.i_subpel_refine]*i_satd_inter)>>1 : COST_MAX;
+
+        /* Sentinel the V/H/DC/Plane slots so callers can tell "not legal
+         * here" from a real cost; the slow loop below only populates a
+         * subset when fewer than 4 modes are available (e.g. missing
+         * neighbours). */
+        a->i_satd_i16x16_dir[0] = a->i_satd_i16x16_dir[1] =
+        a->i_satd_i16x16_dir[2] = a->i_satd_i16x16_dir[3] = COST_MAX;
 
         if( !h->mb.b_lossless && predict_mode[3] >= 0 )
         {
@@ -739,6 +770,13 @@ static void mb_analyse_intra( x264_t *h, x264_mb_analysis_t *a, int i_satd_inter
 
         if( a->i_satd_i16x16 > i16x16_thresh )
             return;
+
+        if( h->param.analyse.i_nn_level )
+        {
+            int b_stop = x264_nn_i16_policy( h, a->i_qp, x264_nn_i16_bias_lookup( h->param.analyse.i_nn_level ) ) == X264_NN_I16_POLICY_STOP;
+            if( b_stop )
+                return;
+        }
     }
 
     uint16_t *cost_i4x4_mode = h->cost_table->i4x4_mode[a->i_qp] + 8;
@@ -1100,6 +1138,16 @@ static void intra_rd_refine( x264_t *h, x264_mb_analysis_t *a )
                 for( int p = 0; p < plane_count; p++ )
                     /* emulate missing topright samples */
                     MPIXEL_X4( dst[p]+4-FDEC_STRIDE ) = PIXEL_SPLAT_X4( dst[p][3-FDEC_STRIDE] );
+
+            int8_t ranked_modes[X264_NN_I4RANK_NUM_MODES + 5];
+            if( h->param.analyse.i_nn_level )
+            {
+                int topk = x264_nn_i4rank_topk_lookup( h->param.analyse.i_nn_level );
+                pixel *p_src_by = h->mb.pic.p_fenc[0] + block_idx_xy_fenc[idx];
+                x264_nn_i4rank_topk( h, idx, a->i_qp, a->i_lambda, predict_mode,
+                                     p_src_by, dst[0], topk, ranked_modes );
+                predict_mode = ranked_modes;
+            }
 
             for( ; *predict_mode >= 0; predict_mode++ )
             {
