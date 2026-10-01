@@ -1886,6 +1886,7 @@ static int encoder_try_reconfig( x264_t *h, x264_param_t *param, int *rc_reconfi
     if( h->param.analyse.i_subpel_refine )
         COPY( analyse.i_subpel_refine );
     COPY( analyse.i_trellis );
+    COPY( analyse.i_nn_level );
     COPY( analyse.b_chroma_me );
     COPY( analyse.b_dct_decimate );
     COPY( analyse.b_fast_pskip );

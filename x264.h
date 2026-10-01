@@ -45,7 +45,7 @@ extern "C" {
 
 #include "x264_config.h"
 
-#define X264_BUILD 165
+#define X264_BUILD 167
 
 #ifdef _WIN32
 #   define X264_DLL_IMPORT __declspec(dllimport)
@@ -428,6 +428,11 @@ typedef struct x264_param_t
         float        f_psy_rd; /* Psy RD strength */
         float        f_psy_trellis; /* Psy trellis strength */
         int          b_psy; /* Toggle all psy optimizations */
+
+        int          i_nn_level; /* NN-assisted pruning of Intra16/Intra4/P16/P8x8/B16
+                                   * mode-decision search. 0 = off (default, bit-exact to
+                                   * no-NN). Higher = faster, with increasing quality/size
+                                   * cost; see --nn in the CLI help for the current range. */
 
         int          b_mb_info;            /* Use input mb_info data in x264_picture_t */
         int          b_mb_info_update; /* Update the values in mb_info according to the results of encoding. */

@@ -17,7 +17,7 @@ GENERATED =
 all: default
 default:
 
-SRCS = common/osdep.c common/base.c common/cpu.c common/tables.c \
+SRCS = common/osdep.c common/base.c common/cpu.c common/tables.c common/nn.c \
        encoder/api.c
 
 SRCS_X = common/mc.c common/predict.c common/pixel.c common/macroblock.c \

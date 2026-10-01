@@ -826,6 +826,9 @@ static void help( x264_param_t *defaults, int longhelp )
         "                                  - 0: disabled\n"
         "                                  - 1: enabled only on the final encode of a MB\n"
         "                                  - 2: enabled on all mode decisions\n", defaults->analyse.i_trellis );
+    H2( "      --nn <integer>          NN-assisted pruning of Intra16/Intra4 mode-decision\n"
+        "                              candidates. 0 = off (bit-exact), higher = faster [%d]\n",
+        defaults->analyse.i_nn_level );
     H2( "      --no-fast-pskip         Disables early SKIP detection on P-frames\n" );
     H2( "      --no-dct-decimate       Disables coefficient thresholding on P-frames\n" );
     H1( "      --nr <integer>          Noise reduction [%d]\n", defaults->analyse.i_noise_reduction );
@@ -1091,6 +1094,7 @@ static struct option long_options[] =
     { "8x8dct",               no_argument,       NULL, '8' },
     { "no-8x8dct",            no_argument,       NULL, 0 },
     { "trellis",              required_argument, NULL, 't' },
+    { "nn",                   required_argument, NULL, 0 },
     { "fast-pskip",           no_argument,       NULL, 0 },
     { "no-fast-pskip",        no_argument,       NULL, 0 },
     { "no-dct-decimate",      no_argument,       NULL, 0 },

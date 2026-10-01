@@ -453,6 +453,7 @@ REALIGN_STACK void x264_param_default( x264_param_t *param )
     param->analyse.b_dct_decimate = 1;
     param->analyse.b_transform_8x8 = 1;
     param->analyse.i_trellis = 1;
+    param->analyse.i_nn_level = 0; /* off by default: keep bit-identical output */
     param->analyse.i_luma_deadzone[0] = 21;
     param->analyse.i_luma_deadzone[1] = 11;
     param->analyse.b_psnr = 0;
@@ -1295,6 +1296,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
         p->analyse.b_mixed_references = atobool(value);
     OPT("trellis")
         p->analyse.i_trellis = atoi(value);
+    OPT("nn")
+        p->analyse.i_nn_level = atoi(value);
     OPT("fast-pskip")
         p->analyse.b_fast_pskip = atobool(value);
     OPT("dct-decimate")
@@ -1459,6 +1462,7 @@ char *x264_param2string( x264_param_t *p, int b_res )
     s += sprintf( s, " me_range=%d", p->analyse.i_me_range );
     s += sprintf( s, " chroma_me=%d", p->analyse.b_chroma_me );
     s += sprintf( s, " trellis=%d", p->analyse.i_trellis );
+    s += sprintf( s, " nn=%d", p->analyse.i_nn_level );
     s += sprintf( s, " 8x8dct=%d", p->analyse.b_transform_8x8 );
     s += sprintf( s, " cqm=%d", p->i_cqm_preset );
     s += sprintf( s, " deadzone=%d,%d", p->analyse.i_luma_deadzone[0], p->analyse.i_luma_deadzone[1] );
