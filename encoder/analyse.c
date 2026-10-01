@@ -32,6 +32,8 @@
 #include "analyse.h"
 #include "nn_intra.h"
 #include "nn_i4rank.h"
+#include "nn_p16.h"
+#include "nn_p8x8.h"
 #include "rdo.c"
 
 typedef struct
@@ -686,6 +688,32 @@ static const int x264_nn_i4rank_topk_table[X264_NN_NUM_LEVELS] = {9, 2, 2, 2, 2,
 static int x264_nn_i4rank_topk_lookup( int level )
 {
     return x264_nn_i4rank_topk_table[level];
+}
+
+/* Regret threshold X264_NN_P16_POLICY_STOP must beat CONTINUE by, indexed
+ * by --nn level (0 = off). Calibrated against real BD-rate/speed on
+ * near-pure P-slice content. The regret target is highly skewed, so the
+ * response is a step rather than a gradient: levels 1-2 stay
+ * low-engagement, 3-5 cross into a large, flat speedup/cost regime. */
+static const int32_t x264_nn_p16_bias[X264_NN_NUM_LEVELS] = {0, 0, 50, 500, 1000, 15000};
+
+static int32_t x264_nn_p16_bias_lookup( int level )
+{
+    return x264_nn_p16_bias[level];
+}
+
+/* Regret threshold for X264_NN_P8X8_POLICY_STOP, indexed by --nn level.
+ * Calibrated against real BD-rate/speed. Only reachable when P16 chooses
+ * CONTINUE and P_8x8 wins the 16x16-level partition -- since both share
+ * the --nn knob and P16 reaches near-100% stop by level 3, that would
+ * starve this decision to a handful of blocks. Levels 3-5 disable it
+ * instead (32767 = int16 max, guarantees STOP); real working range is
+ * levels 1-2. */
+static const int32_t x264_nn_p8x8_bias[X264_NN_NUM_LEVELS] = {0, 100, 500, 32767, 32767, 32767};
+
+static int32_t x264_nn_p8x8_bias_lookup( int level )
+{
+    return x264_nn_p8x8_bias[level];
 }
 
 /* FIXME: should we do any sort of merged chroma analysis with 4:4:4? */
@@ -3092,12 +3120,20 @@ skip_analysis:
                 return;
             }
 
-            if( flags & X264_ANALYSE_PSUB16x16 )
+            int b_p16_stop = 0;
+            /* Independent guard from the shared i_nn_level clamp in
+             * encoder.c, which only checks X264_NN_WEIGHTS_TRAINED (I16/
+             * I4's flag). Each net needs its own check, or an untrained
+             * net's all-zero weights would deterministically return STOP
+             * for every MB. */
+            if( h->param.analyse.i_nn_level && X264_NN_P16_WEIGHTS_TRAINED )
             {
-                if( h->param.analyse.b_mixed_references )
-                    mb_analyse_inter_p8x8_mixed_ref( h, &analysis );
-                else
-                    mb_analyse_inter_p8x8( h, &analysis );
+                int32_t satd_p16x16 = analysis.l0.me16x16.cost - analysis.l0.me16x16.cost_mv
+                                     - analysis.l0.me16x16.i_ref_cost;
+                b_p16_stop = x264_nn_p16_policy( h, analysis.i_qp, satd_p16x16,
+                                                 analysis.l0.me16x16.cost_mv, analysis.l0.me16x16.i_ref,
+                                                 x264_nn_p16_bias_lookup( h->param.analyse.i_nn_level ) )
+                           == X264_NN_P16_POLICY_STOP;
             }
 
             /* Select best inter mode */
@@ -3105,59 +3141,91 @@ skip_analysis:
             i_partition = D_16x16;
             i_cost = analysis.l0.me16x16.cost;
 
-            if( ( flags & X264_ANALYSE_PSUB16x16 ) && (!analysis.b_early_terminate ||
-                analysis.l0.i_cost8x8 < analysis.l0.me16x16.cost) )
+            /* b_p16_stop guards this entire cascade, not just
+             * mb_analyse_inter_p8x8(): checks below (e.g. i_thresh16x8)
+             * unconditionally read analysis.l0.me8x8[].cost_mv, assuming
+             * p8x8 always ran. STOP keeps the P_L0/D_16x16 defaults above
+             * and skips the whole cascade. */
+            if( ( flags & X264_ANALYSE_PSUB16x16 ) && !b_p16_stop )
             {
-                i_type = P_8x8;
-                i_partition = D_8x8;
-                i_cost = analysis.l0.i_cost8x8;
+                if( h->param.analyse.b_mixed_references )
+                    mb_analyse_inter_p8x8_mixed_ref( h, &analysis );
+                else
+                    mb_analyse_inter_p8x8( h, &analysis );
 
-                /* Do sub 8x8 */
-                if( flags & X264_ANALYSE_PSUB8x8 )
+                if( !analysis.b_early_terminate ||
+                    analysis.l0.i_cost8x8 < analysis.l0.me16x16.cost )
                 {
-                    for( int i = 0; i < 4; i++ )
+                    i_type = P_8x8;
+                    i_partition = D_8x8;
+                    i_cost = analysis.l0.i_cost8x8;
+
+                    /* Do sub 8x8 */
+                    if( flags & X264_ANALYSE_PSUB8x8 )
                     {
-                        mb_analyse_inter_p4x4( h, &analysis, i );
-                        int i_thresh8x4 = analysis.l0.me4x4[i][1].cost_mv + analysis.l0.me4x4[i][2].cost_mv;
-                        if( !analysis.b_early_terminate || analysis.l0.i_cost4x4[i] < analysis.l0.me8x8[i].cost + i_thresh8x4 )
+                        for( int i = 0; i < 4; i++ )
                         {
-                            int i_cost8x8 = analysis.l0.i_cost4x4[i];
-                            h->mb.i_sub_partition[i] = D_L0_4x4;
+                            /* Per-8x8-block STOP guards the block's entire inner cascade, not
+                             * just p4x4 -- same reasoning as b_p16_stop above.
+                             * h->mb.i_sub_partition[i] defaults to D_L0_8x8 and i_cost already
+                             * carries this block's undivided cost, so STOP needs no
+                             * bookkeeping. */
+                            int b_p8x8_block_stop = 0;
+                            if( h->param.analyse.i_nn_level && X264_NN_P8X8_WEIGHTS_TRAINED )
+                            {
+                                int32_t satd_8x8 = analysis.l0.me8x8[i].cost - analysis.l0.me8x8[i].cost_mv
+                                                  - analysis.l0.me8x8[i].i_ref_cost;
+                                b_p8x8_block_stop = x264_nn_p8x8_policy( h, i, analysis.i_qp, satd_8x8,
+                                                                         analysis.l0.me8x8[i].cost_mv, analysis.l0.me8x8[i].i_ref,
+                                                                         x264_nn_p8x8_bias_lookup( h->param.analyse.i_nn_level ) )
+                                                   == X264_NN_P8X8_POLICY_STOP;
+                            }
 
-                            mb_analyse_inter_p8x4( h, &analysis, i );
-                            COPY2_IF_LT( i_cost8x8, analysis.l0.i_cost8x4[i],
-                                         h->mb.i_sub_partition[i], D_L0_8x4 );
+                            if( !b_p8x8_block_stop )
+                            {
+                                mb_analyse_inter_p4x4( h, &analysis, i );
+                                int i_thresh8x4 = analysis.l0.me4x4[i][1].cost_mv + analysis.l0.me4x4[i][2].cost_mv;
+                                if( !analysis.b_early_terminate || analysis.l0.i_cost4x4[i] < analysis.l0.me8x8[i].cost + i_thresh8x4 )
+                                {
+                                    int i_cost8x8 = analysis.l0.i_cost4x4[i];
+                                    h->mb.i_sub_partition[i] = D_L0_4x4;
 
-                            mb_analyse_inter_p4x8( h, &analysis, i );
-                            COPY2_IF_LT( i_cost8x8, analysis.l0.i_cost4x8[i],
-                                         h->mb.i_sub_partition[i], D_L0_4x8 );
+                                    mb_analyse_inter_p8x4( h, &analysis, i );
+                                    COPY2_IF_LT( i_cost8x8, analysis.l0.i_cost8x4[i],
+                                                 h->mb.i_sub_partition[i], D_L0_8x4 );
 
-                            i_cost += i_cost8x8 - analysis.l0.me8x8[i].cost;
+                                    mb_analyse_inter_p4x8( h, &analysis, i );
+                                    COPY2_IF_LT( i_cost8x8, analysis.l0.i_cost4x8[i],
+                                                 h->mb.i_sub_partition[i], D_L0_4x8 );
+
+                                    i_cost += i_cost8x8 - analysis.l0.me8x8[i].cost;
+                                }
+                            }
+                            mb_cache_mv_p8x8( h, &analysis, i );
                         }
-                        mb_cache_mv_p8x8( h, &analysis, i );
+                        analysis.l0.i_cost8x8 = i_cost;
                     }
-                    analysis.l0.i_cost8x8 = i_cost;
                 }
-            }
 
-            /* Now do 16x8/8x16 */
-            int i_thresh16x8 = analysis.l0.me8x8[1].cost_mv + analysis.l0.me8x8[2].cost_mv;
-            if( ( flags & X264_ANALYSE_PSUB16x16 ) && (!analysis.b_early_terminate ||
-                analysis.l0.i_cost8x8 < analysis.l0.me16x16.cost + i_thresh16x8) )
-            {
-                int i_avg_mv_ref_cost = (analysis.l0.me8x8[2].cost_mv + analysis.l0.me8x8[2].i_ref_cost
+                /* Now do 16x8/8x16 */
+                int i_thresh16x8 = analysis.l0.me8x8[1].cost_mv + analysis.l0.me8x8[2].cost_mv;
+                if( !analysis.b_early_terminate ||
+                    analysis.l0.i_cost8x8 < analysis.l0.me16x16.cost + i_thresh16x8 )
+                {
+                    int i_avg_mv_ref_cost = (analysis.l0.me8x8[2].cost_mv + analysis.l0.me8x8[2].i_ref_cost
+                                          + analysis.l0.me8x8[3].cost_mv + analysis.l0.me8x8[3].i_ref_cost + 1) >> 1;
+                    analysis.i_cost_est16x8[1] = analysis.i_satd8x8[0][2] + analysis.i_satd8x8[0][3] + i_avg_mv_ref_cost;
+
+                    mb_analyse_inter_p16x8( h, &analysis, i_cost );
+                    COPY3_IF_LT( i_cost, analysis.l0.i_cost16x8, i_type, P_L0, i_partition, D_16x8 );
+
+                    i_avg_mv_ref_cost = (analysis.l0.me8x8[1].cost_mv + analysis.l0.me8x8[1].i_ref_cost
                                       + analysis.l0.me8x8[3].cost_mv + analysis.l0.me8x8[3].i_ref_cost + 1) >> 1;
-                analysis.i_cost_est16x8[1] = analysis.i_satd8x8[0][2] + analysis.i_satd8x8[0][3] + i_avg_mv_ref_cost;
+                    analysis.i_cost_est8x16[1] = analysis.i_satd8x8[0][1] + analysis.i_satd8x8[0][3] + i_avg_mv_ref_cost;
 
-                mb_analyse_inter_p16x8( h, &analysis, i_cost );
-                COPY3_IF_LT( i_cost, analysis.l0.i_cost16x8, i_type, P_L0, i_partition, D_16x8 );
-
-                i_avg_mv_ref_cost = (analysis.l0.me8x8[1].cost_mv + analysis.l0.me8x8[1].i_ref_cost
-                                  + analysis.l0.me8x8[3].cost_mv + analysis.l0.me8x8[3].i_ref_cost + 1) >> 1;
-                analysis.i_cost_est8x16[1] = analysis.i_satd8x8[0][1] + analysis.i_satd8x8[0][3] + i_avg_mv_ref_cost;
-
-                mb_analyse_inter_p8x16( h, &analysis, i_cost );
-                COPY3_IF_LT( i_cost, analysis.l0.i_cost8x16, i_type, P_L0, i_partition, D_8x16 );
+                    mb_analyse_inter_p8x16( h, &analysis, i_cost );
+                    COPY3_IF_LT( i_cost, analysis.l0.i_cost8x16, i_type, P_L0, i_partition, D_8x16 );
+                }
             }
 
             h->mb.i_partition = i_partition;
